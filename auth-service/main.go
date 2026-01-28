@@ -38,6 +38,37 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		)
 	})
 }
+
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.Background()
+		ip := r.RemoteAddr
+
+		key := "rate_limit:" + ip
+
+		// Increment counter
+		count, err := rdb.Incr(ctx, key).Result()
+		if err != nil {
+			log.Println("rate limit redis error:", err)
+			next.ServeHTTP(w, r) // fail open for now
+			return
+		}
+
+		// Set expiration if first request
+		if count == 1 {
+			rdb.Expire(ctx, key, time.Minute)
+		}
+
+		if count > 10 {
+			log.Printf("RATE LIMITED ip=%s count=%d", ip, count)
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 type responseWriter struct {
 	http.ResponseWriter
 	statusCode int
@@ -89,7 +120,9 @@ func main() {
 		Addr: "redis:6379",
 	})
 
-	http.Handle("/health", loggingMiddleware(http.HandlerFunc(healthHandler)))
+	handler := rateLimitMiddleware(loggingMiddleware(http.HandlerFunc(healthHandler)))
+	http.Handle("/health", handler)
+
 
 	log.Println("Auth service running on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
