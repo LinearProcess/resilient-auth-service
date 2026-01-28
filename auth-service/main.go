@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 )
@@ -106,6 +108,63 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(status)
 }
 
+func initDB() {
+	query := `
+	CREATE TABLE IF NOT EXISTS users (
+		id SERIAL PRIMARY KEY,
+		email TEXT UNIQUE NOT NULL,
+		password_hash TEXT NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);`
+
+	_, err := db.Exec(query)
+	if err != nil {
+		log.Fatal("Failed to create users table:", err)
+	}
+}
+
+type registerRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+func registerHandler(w http.ResponseWriter, r *http.Request) {
+	var req registerRequest
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
+
+	_, err = db.Exec("INSERT INTO users (email, password_hash) VALUES ($1, $2)", req.Email, string(hash))
+	if err != nil {
+		http.Error(w, "User already exists", http.StatusConflict)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	w.Write([]byte("User registered"))
+}
+
+func waitForDB() {
+	for i := 0; i < 10; i++ {
+		err := db.Ping()
+		if err == nil {
+			log.Println("Connected to DB")
+			return
+		}
+		log.Println("Waiting for DB...")
+		time.Sleep(2 * time.Second)
+	}
+	log.Fatal("DB never became ready")
+}
+
 func main() {
 	// Postgres connection
 	connStr := "postgres://authuser:authpass@postgres:5432/authdb?sslmode=disable"
@@ -114,14 +173,17 @@ func main() {
 	if err != nil {
 		log.Fatal("DB connection error:", err)
 	}
+	
+	waitForDB()
+	initDB()
 
 	// Redis connection
 	rdb = redis.NewClient(&redis.Options{
 		Addr: "redis:6379",
 	})
 
-	handler := rateLimitMiddleware(loggingMiddleware(http.HandlerFunc(healthHandler)))
-	http.Handle("/health", handler)
+	http.Handle("/register", rateLimitMiddleware(loggingMiddleware(http.HandlerFunc(registerHandler))))
+	http.Handle("/health", rateLimitMiddleware(loggingMiddleware(http.HandlerFunc(healthHandler))))
 
 
 	log.Println("Auth service running on :8080")
