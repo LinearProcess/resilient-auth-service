@@ -12,10 +12,13 @@ import (
 
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
+	"github.com/google/uuid"
+
 )
 
 var db *sql.DB
 var rdb *redis.Client
+var ctx = context.Background()
 
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -165,6 +168,81 @@ func waitForDB() {
 	log.Fatal("DB never became ready")
 }
 
+type loginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	var req loginRequest
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	var storedHash string
+	err := db.QueryRow("SELECT password_hash FROM users WHERE email=$1", req.Email).Scan(&storedHash)
+	if err != nil {
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	err = bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(req.Password))
+	if err != nil {
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	// Create session ID
+	sessionID := uuid.New().String()
+
+	// Store session in Redis (user email tied to session)
+	err = rdb.Set(ctx, "session:"+sessionID, req.Email, time.Hour*24).Err()
+	if err != nil {
+		http.Error(w, "Session error", http.StatusInternalServerError)
+		return
+	}
+
+	// Send secure cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_id",
+		Value:    sessionID,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   false, // true in production (HTTPS)
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	w.Write([]byte("Logged in"))
+}
+
+func authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		cookie, err := r.Cookie("session_id")
+		if err != nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		email, err := rdb.Get(ctx, "session:"+cookie.Value).Result()
+		if err != nil {
+			http.Error(w, "Session expired or invalid", http.StatusUnauthorized)
+			return
+		}
+
+		// Add user email to request context
+		ctxWithUser := context.WithValue(r.Context(), "userEmail", email)
+		next.ServeHTTP(w, r.WithContext(ctxWithUser))
+	})
+}
+
+func meHandler(w http.ResponseWriter, r *http.Request) {
+	email := r.Context().Value("userEmail").(string)
+	w.Write([]byte("Hello " + email))
+}
+
 func main() {
 	// Postgres connection
 	connStr := "postgres://authuser:authpass@postgres:5432/authdb?sslmode=disable"
@@ -173,7 +251,7 @@ func main() {
 	if err != nil {
 		log.Fatal("DB connection error:", err)
 	}
-	
+
 	waitForDB()
 	initDB()
 
@@ -182,9 +260,26 @@ func main() {
 		Addr: "redis:6379",
 	})
 
-	http.Handle("/register", rateLimitMiddleware(loggingMiddleware(http.HandlerFunc(registerHandler))))
-	http.Handle("/health", rateLimitMiddleware(loggingMiddleware(http.HandlerFunc(healthHandler))))
+	// Routes
+	http.Handle("/health",
+		rateLimitMiddleware(loggingMiddleware(http.HandlerFunc(healthHandler))),
+	)
 
+	http.Handle("/register",
+		rateLimitMiddleware(loggingMiddleware(http.HandlerFunc(registerHandler))),
+	)
+
+	http.Handle("/login",
+		rateLimitMiddleware(loggingMiddleware(http.HandlerFunc(loginHandler))),
+	)
+
+	http.Handle("/me",
+		authMiddleware(
+			rateLimitMiddleware(
+				loggingMiddleware(http.HandlerFunc(meHandler)),
+			),
+		),
+	)
 
 	log.Println("Auth service running on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
