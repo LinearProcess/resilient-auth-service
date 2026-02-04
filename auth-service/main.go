@@ -7,18 +7,20 @@ import (
 	"log"
 	"net/http"
 	"time"
+	"fmt"
 
 	"golang.org/x/crypto/bcrypt"
 
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
-	"github.com/google/uuid"
+	"github.com/golang-jwt/jwt/v5"
 
 )
 
 var db *sql.DB
 var rdb *redis.Client
 var ctx = context.Background()
+var jwtSecret = []byte("super-secret-key-change-me")
 
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -193,25 +195,26 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}
+	// Create JWT token
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+	    "email": req.Email,
+    	    "exp":   time.Now().Add(24 * time.Hour).Unix(),
+	})
 
-	// Create session ID
-	sessionID := uuid.New().String()
-
-	// Store session in Redis (user email tied to session)
-	err = rdb.Set(ctx, "session:"+sessionID, req.Email, time.Hour*24).Err()
+	tokenString, err := token.SignedString(jwtSecret)
 	if err != nil {
-		http.Error(w, "Session error", http.StatusInternalServerError)
-		return
+    	    http.Error(w, "Token error", http.StatusInternalServerError)
+    	    return
 	}
 
-	// Send secure cookie
+	// Send JWT as cookie
 	http.SetCookie(w, &http.Cookie{
-		Name:     "session_id",
-		Value:    sessionID,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   false, // true in production (HTTPS)
-		SameSite: http.SameSiteLaxMode,
+	    Name:     "auth_token",
+    	    Value:    tokenString,
+    	    Path:     "/",
+    	    HttpOnly: true,
+    	    Secure:   false,
+	    SameSite: http.SameSiteLaxMode,
 	})
 
 	w.Write([]byte("Logged in"))
@@ -237,10 +240,65 @@ func authMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r.WithContext(ctxWithUser))
 	})
 }
+func jwtMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+        // Step 1: Read the auth token cookie
+        cookie, err := r.Cookie("auth_token")
+        if err != nil {
+            http.Error(w, "Unauthorized - No token", http.StatusUnauthorized)
+            return
+        }
+
+        // Step 2: Parse and validate the token signature AND signing method
+        token, err := jwt.Parse(cookie.Value, func(t *jwt.Token) (interface{}, error) {
+
+            // Security check: ensure token was signed with HMAC (HS256)
+            if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+                return nil, fmt.Errorf("unexpected signing method")
+            }
+
+            return jwtSecret, nil
+        })
+
+        // If parsing failed or token is invalid/expired → reject
+        if err != nil || !token.Valid {
+            http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
+            return
+        }
+
+        // Step 3: Safely extract claims from token
+        claims, ok := token.Claims.(jwt.MapClaims)
+        if !ok {
+            http.Error(w, "Invalid token claims", http.StatusUnauthorized)
+            return
+        }
+
+        // Extract the user email (identity)
+        email, ok := claims["email"].(string)
+        if !ok {
+            http.Error(w, "Invalid identity in token", http.StatusUnauthorized)
+            return
+        }
+
+        // Step 4: Store identity in request context (for handlers to use)
+        ctxWithUser := context.WithValue(r.Context(), "userEmail", email)
+
+        // Pass request down the middleware chain
+        next.ServeHTTP(w, r.WithContext(ctxWithUser))
+    })
+}
 
 func meHandler(w http.ResponseWriter, r *http.Request) {
-	email := r.Context().Value("userEmail").(string)
-	w.Write([]byte("Hello " + email))
+
+    // Identity comes from middleware, not cookies
+    email, ok := r.Context().Value("userEmail").(string)
+    if !ok {
+        http.Error(w, "User not found in context", http.StatusUnauthorized)
+        return
+    }
+
+    w.Write([]byte("Hello " + email))
 }
 
 func main() {
@@ -274,7 +332,7 @@ func main() {
 	)
 
 	http.Handle("/me",
-		authMiddleware(
+		jwtMiddleware(
 			rateLimitMiddleware(
 				loggingMiddleware(http.HandlerFunc(meHandler)),
 			),
